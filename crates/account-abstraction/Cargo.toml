@@ -6,10 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Account Abstraction (EIP-4337) RPC Support"
-
-[lints]
-workspace = true
 
 [dependencies]
 # reth
@@ -27,15 +23,29 @@ reth-optimism-cli.workspace = true  # Enables serde & codec traits for OpReceipt
 # alloy
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-provider.workspace = true
 
 # rpc
 jsonrpsee.workspace = true
 
+# Internal AA crates (for gas estimation)
+aa-sim = { path = "crates/sim" }
+aa-types = { path = "crates/types" }
+aa-provider = { path = "crates/provider" }
+
 # misc
+async-trait = { workspace = true }
 tracing.workspace = true
 serde.workspace = true
 eyre.workspace = true
+anyhow = "1.0"
+tokio = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+[[example]]
+name = "simple"
+required-features = []

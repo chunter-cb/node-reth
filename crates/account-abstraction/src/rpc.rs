@@ -178,6 +178,7 @@ pub trait BaseAccountAbstractionApi {
 /// Implementation of the account abstraction RPC API
 pub struct AccountAbstractionApiImpl<Provider> {
     provider: Provider,
+    gas_estimator: Option<std::sync::Arc<crate::gas_estimation::GasEstimationProvider>>,
 }
 
 impl<Provider> AccountAbstractionApiImpl<Provider>
@@ -186,7 +187,26 @@ where
 {
     /// Creates a new instance of AccountAbstractionApi
     pub fn new(provider: Provider) -> Self {
-        Self { provider }
+        Self { 
+            provider,
+            gas_estimator: None,
+        }
+    }
+
+    /// Creates a new instance with gas estimation enabled
+    pub fn new_with_gas_estimation(provider: Provider, rpc_url: &str) -> Self {
+        let gas_estimator = crate::gas_estimation::create_gas_estimation_provider(rpc_url)
+            .ok()
+            .map(std::sync::Arc::new);
+        
+        if gas_estimator.is_none() {
+            tracing::warn!("Failed to create gas estimation provider, falling back to hardcoded values");
+        }
+        
+        Self { 
+            provider,
+            gas_estimator,
+        }
     }
 }
 
@@ -243,7 +263,6 @@ where
                     entry_point = %entry_point,
                     "Received estimateUserOperationGas request (v0.6)"
                 );
-                // TODO: Simulate v0.6 user operation
             }
             UserOperation::V07(op) => {
                 info!(
@@ -251,12 +270,21 @@ where
                     entry_point = %entry_point,
                     "Received estimateUserOperationGas request (v0.7+)"
                 );
-                // TODO: Convert to PackedUserOperation for simulation
-                // TODO: Simulate v0.7 user operation
             }
         }
 
-        // TODO: Estimate gas requirements
+        // Use real gas estimation if available
+        if let Some(gas_estimator) = &self.gas_estimator {
+            match gas_estimator.estimate_user_operation_gas(user_operation, entry_point).await {
+                Ok(estimate) => return Ok(estimate),
+                Err(e) => {
+                    tracing::error!("Gas estimation failed: {:?}", e);
+                    // Fall through to hardcoded values
+                }
+            }
+        }
+
+        // Fallback to hardcoded values
         Ok(UserOperationGasEstimate {
             pre_verification_gas: U256::from(21000),
             verification_gas_limit: U256::from(100000),

@@ -1,0 +1,26 @@
+[package]
+name = "aa-utils"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+alloy-primitives = "1.0"
+alloy-rpc-types-eth = "1.0"
+
+anyhow = "1.0"
+derive_more = "0.99.18"
+itertools = "0.13"
+metrics = "0.24"
+rand = "0.8"
+schnellru = "0.2.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+alloy-consensus = "1.0"
+alloy-eips = "1.0"

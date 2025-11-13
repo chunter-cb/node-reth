@@ -1,0 +1,26 @@
+[package]
+name = "aa-task"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+alloy-primitives = "1.0"
+
+anyhow = "1.0"
+async-trait = "0.1"
+pin-project = "1.1"
+reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.4.7" }
+aa-provider = { path = "../provider" }
+aa-types = { path = "../types" }
+aa-utils = { path = "../utils" }
+thiserror = "1.0"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+tower = "0.4"
+tracing = "0.1"

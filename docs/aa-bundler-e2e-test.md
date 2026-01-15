@@ -5,8 +5,13 @@ This guide walks through testing the native AA bundler end-to-end using the loca
 ## Prerequisites
 
 - Docker installed and running
-- [builder-playground-aa](https://github.com/flashbots/builder-playground) cloned and built
 - Foundry installed (`cast` command available)
+- AA-enabled builder-playground:
+  ```bash
+  git clone -b aa https://github.com/chunter-cb/builder-playground.git
+  cd builder-playground
+  go build -o playground-bin ./cmd/playground
+  ```
 
 ## Steps
 
@@ -23,7 +28,7 @@ docker build --platform linux/arm64 -t base-reth-node:latest -f Dockerfile .
 ### 2. Start Playground
 
 ```bash
-cd /path/to/builder-playground-aa
+cd builder-playground
 ./playground-bin start opstack --aa --flashblocks --external-builder op-rbuilder
 ```
 
@@ -102,6 +107,6 @@ User → base-reth-node (eth_sendUserOperation)
 ## Cleanup
 
 ```bash
-cd /path/to/builder-playground-aa
+cd builder-playground
 ./playground-bin clean all
 ```

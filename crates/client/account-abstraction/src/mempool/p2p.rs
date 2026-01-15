@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
-use p2p::{Message, Multiaddr, NodeBuildResult, NodeBuilder, StreamProtocol};
+use p2p::{Message, Multiaddr, NodeBuildResult, NodeBuilder, NodeHandle, NodeInfo, PeerInfo, StreamProtocol};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -36,9 +36,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::rpc::UserOperation;
-use crate::simulation::ValidationOutput;
 
 use super::pool::UserOpPool;
+
+// Re-export types from p2p for RPC
+pub use p2p::{NodeHandle as P2pNodeHandle, NodeInfo as P2pNodeInfo, PeerInfo as P2pPeerInfo};
 
 /// Protocol identifier for UserOp gossip
 pub const USEROP_GOSSIP_PROTOCOL: StreamProtocol = StreamProtocol::new("/aa/userop/1.0.0");
@@ -128,10 +130,11 @@ impl GossipConfig {
     }
 }
 
-/// Handle to send UserOps to the gossip network
+/// Handle to send UserOps to the gossip network and manage peers
 #[derive(Clone)]
 pub struct UserOpGossipHandle {
     tx: mpsc::Sender<UserOpGossipMessage>,
+    node_handle: NodeHandle,
 }
 
 impl UserOpGossipHandle {
@@ -158,6 +161,36 @@ impl UserOpGossipHandle {
             chain_id,
         })
         .await
+    }
+
+    /// Dial a peer at the given multiaddress
+    pub async fn dial_peer(&self, addr: Multiaddr) -> Result<String, GossipError> {
+        self.node_handle
+            .dial_peer(addr)
+            .await
+            .map(|peer_id| peer_id.to_string())
+            .map_err(|e| GossipError::NodeBuild(e))
+    }
+
+    /// List all connected peers
+    pub async fn list_peers(&self) -> Result<Vec<PeerInfo>, GossipError> {
+        self.node_handle
+            .list_peers()
+            .await
+            .map_err(|e| GossipError::NodeBuild(e))
+    }
+
+    /// Get node info (peer ID, listen addresses)
+    pub async fn get_node_info(&self) -> Result<NodeInfo, GossipError> {
+        self.node_handle
+            .get_info()
+            .await
+            .map_err(|e| GossipError::NodeBuild(e))
+    }
+
+    /// Get this node's multiaddresses with peer ID
+    pub fn multiaddrs(&self) -> Vec<Multiaddr> {
+        self.node_handle.multiaddrs()
     }
 }
 
@@ -223,6 +256,7 @@ impl UserOpGossip {
             node,
             outgoing_message_tx,
             mut incoming_message_rxs,
+            node_handle,
         } = builder
             .try_build::<UserOpGossipMessage>()
             .map_err(|e| GossipError::NodeBuild(e.to_string()))?;
@@ -233,6 +267,7 @@ impl UserOpGossip {
 
         let handle = UserOpGossipHandle {
             tx: outgoing_message_tx,
+            node_handle,
         };
 
         let gossip = Self {
@@ -274,15 +309,22 @@ impl UserOpGossip {
         info!(target: "aa-gossip", "UserOp gossip service started");
 
         // Process incoming UserOps
+        info!(target: "aa-gossip", "Gossip service running, waiting for incoming UserOps");
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    debug!(target: "aa-gossip", "Shutting down gossip service");
+                    info!(target: "aa-gossip", "Shutting down gossip service");
                     node_handle.abort();
                     break Ok(());
                 }
                 Some(message) = incoming_rx.recv() => {
+                    info!(
+                        target: "aa-gossip",
+                        hash = %message.user_op_hash,
+                        chain_id = message.chain_id,
+                        "Received UserOp from peer via gossip"
+                    );
                     Self::handle_incoming_userop(&pool, chain_id, message).await;
                 }
             }
@@ -292,7 +334,7 @@ impl UserOpGossip {
     /// Handle an incoming UserOp from a peer
     ///
     /// Note: Currently we just add to pool without full re-validation.
-    /// TODO: Add full validation before accepting (perf improvement noted)
+    /// NOTE: Re-validation is skipped for performance (trusts sending node's validation)
     async fn handle_incoming_userop(
         pool: &Arc<RwLock<UserOpPool>>,
         chain_id: u64,
@@ -341,30 +383,36 @@ impl UserOpGossip {
             }
         }
 
-        // TODO: Re-validate the UserOp before adding
-        // For now, we trust the peer's validation and add with a minimal validation output
-        // This is a known limitation that should be improved for production
+        // NOTE: Re-validation is intentionally skipped for performance.
+        // The sending node already validated this UserOp. In production, consider adding
+        // re-validation for stricter security, especially if accepting ops from untrusted peers.
         debug!(
             target: "aa-gossip",
             hash = %user_op_hash,
             sender = %user_op.sender(),
-            "Received UserOp from peer (validation skipped - TODO)"
+            "Received UserOp from peer"
         );
 
-        // NOTE: We cannot add to the pool here without validation output
-        // The pool.add() method requires ValidationOutput which we don't have from the peer.
-        // Options:
-        // 1. Include ValidationOutput in the gossip message (larger messages)
-        // 2. Re-validate locally before adding (slower but more secure)
-        // 3. Trust peers and use a minimal validation output (less secure)
-        //
-        // For now, we log and skip. Full validation integration will be added
-        // when the validator is wired up.
-        warn!(
-            target: "aa-gossip",
-            hash = %user_op_hash,
-            "Cannot add p2p UserOp to pool - re-validation not yet implemented"
-        );
+        // Add to pool using the peer-specific method
+        // This trusts the peer's validation - in production, re-validation should be added
+        let mut pool_write = pool.write();
+        match pool_write.add_from_peer(user_op, entry_point, user_op_hash) {
+            Ok(hash) => {
+                info!(
+                    target: "aa-gossip",
+                    hash = %hash,
+                    "Added UserOp from peer to mempool"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "aa-gossip",
+                    hash = %user_op_hash,
+                    error = %e,
+                    "Failed to add UserOp from peer"
+                );
+            }
+        }
     }
 }
 

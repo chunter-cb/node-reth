@@ -73,6 +73,8 @@ pub struct OpRbuilderArgs {
     pub flashtestations: FlashtestationsArgs,
     #[command(flatten)]
     pub gas_limiter: GasLimiterArgs,
+    #[command(flatten)]
+    pub aa_mempool: AAMempoolArgs,
 }
 
 impl Default for OpRbuilderArgs {
@@ -186,6 +188,10 @@ pub struct FlashblocksArgs {
     /// Flashblocks p2p configuration
     #[command(flatten)]
     pub p2p: FlashblocksP2pArgs,
+
+    /// AA Bundler configuration
+    #[command(flatten)]
+    pub bundler: BundlerArgs,
 }
 
 impl Default for FlashblocksArgs {
@@ -239,6 +245,164 @@ pub struct FlashblocksP2pArgs {
         default_value = "50"
     )]
     pub p2p_max_peer_count: u32,
+}
+
+/// Parameters for AA Bundler configuration
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct BundlerArgs {
+    /// Enable AA bundler in flashblocks builder
+    #[arg(
+        long = "flashblocks.bundler-enabled",
+        env = "FLASHBLOCKS_BUNDLER_ENABLED",
+        default_value = "false",
+        id = "bundler_enabled"
+    )]
+    pub enabled: bool,
+
+    /// Gas percentage threshold to trigger bundling (0-100)
+    /// Bundling starts when standard tx gas usage reaches this % of flashblock target
+    #[arg(
+        long = "flashblocks.bundler-gas-threshold",
+        env = "FLASHBLOCKS_BUNDLER_GAS_THRESHOLD",
+        default_value = "30",
+        id = "bundler_gas_threshold"
+    )]
+    pub gas_threshold_percent: u8,
+
+    /// Maximum UserOps per bundle (per entrypoint)
+    #[arg(
+        long = "flashblocks.bundler-max-ops",
+        env = "FLASHBLOCKS_BUNDLER_MAX_OPS",
+        default_value = "50",
+        id = "bundler_max_ops"
+    )]
+    pub max_ops_per_bundle: usize,
+
+    /// Maximum gas per bundle (across all UserOps)
+    #[arg(
+        long = "flashblocks.bundler-max-gas",
+        env = "FLASHBLOCKS_BUNDLER_MAX_GAS",
+        default_value = "21000000",
+        id = "bundler_max_gas"
+    )]
+    pub max_bundle_gas: u64,
+
+    /// Maximum bundle build retries when UserOps fail
+    /// Each retry removes the offending UserOp and rebuilds
+    #[arg(
+        long = "flashblocks.bundler-max-retries",
+        env = "FLASHBLOCKS_BUNDLER_MAX_RETRIES",
+        default_value = "10",
+        id = "bundler_max_retries"
+    )]
+    pub max_bundle_retries: u8,
+
+    /// Beneficiary address for handleOps (receives gas refunds)
+    /// Defaults to builder_signer address if not set
+    #[arg(
+        long = "flashblocks.bundler-beneficiary",
+        env = "FLASHBLOCKS_BUNDLER_BENEFICIARY",
+        id = "bundler_beneficiary"
+    )]
+    pub beneficiary: Option<Address>,
+}
+
+impl Default for BundlerArgs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gas_threshold_percent: 30,
+            max_ops_per_bundle: 50,
+            max_bundle_gas: 21_000_000,
+            max_bundle_retries: 10,
+            beneficiary: None,
+        }
+    }
+}
+
+/// Parameters for Account Abstraction mempool configuration
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct AAMempoolArgs {
+    /// Enable the AA (ERC-4337) UserOperation mempool.
+    /// When enabled, the builder will create and manage a local mempool for UserOperations.
+    #[arg(
+        long = "aa.mempool-enabled",
+        env = "AA_MEMPOOL_ENABLED",
+        default_value = "false",
+        id = "aa_mempool_enabled"
+    )]
+    pub enabled: bool,
+
+    /// Maximum UserOps per sender in the mempool
+    #[arg(
+        long = "aa.max-ops-per-sender",
+        env = "AA_MAX_OPS_PER_SENDER",
+        default_value = "4",
+        id = "aa_max_ops_per_sender"
+    )]
+    pub max_ops_per_sender: usize,
+
+    /// Maximum total UserOps per entrypoint in the mempool
+    #[arg(
+        long = "aa.max-pool-size",
+        env = "AA_MAX_POOL_SIZE",
+        default_value = "10000",
+        id = "aa_max_pool_size"
+    )]
+    pub max_pool_size: usize,
+
+    /// Enable p2p gossip for AA UserOperations.
+    /// When enabled, UserOps will be shared with connected peers.
+    #[arg(
+        long = "aa.p2p-enabled",
+        env = "AA_P2P_ENABLED",
+        default_value = "false",
+        id = "aa_p2p_enabled"
+    )]
+    pub p2p_enabled: bool,
+
+    /// Port for the AA p2p gossip service
+    #[arg(
+        long = "aa.p2p-port",
+        env = "AA_P2P_PORT",
+        default_value = "9546",
+        id = "aa_p2p_port"
+    )]
+    pub p2p_port: u16,
+
+    /// Known AA p2p peers to connect to (comma-separated multiaddrs)
+    /// Example: /ip4/127.0.0.1/tcp/9545/p2p/12D3KooW...
+    #[arg(
+        long = "aa.p2p-peers",
+        env = "AA_P2P_PEERS",
+        value_delimiter = ',',
+        id = "aa_p2p_peers"
+    )]
+    pub p2p_peers: Vec<String>,
+
+    /// Hex-encoded ed25519 private key for p2p node identity.
+    /// If not provided, a random key is generated on each startup.
+    /// This allows deterministic peer IDs for easier configuration.
+    #[arg(
+        long = "aa.p2p-keypair",
+        env = "AA_P2P_KEYPAIR",
+        id = "aa_p2p_keypair"
+    )]
+    pub p2p_keypair: Option<String>,
+}
+
+impl Default for AAMempoolArgs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_ops_per_sender: 4,
+            max_pool_size: 10_000,
+            p2p_enabled: false,
+            p2p_port: 9546,
+            p2p_peers: Vec::new(),
+            p2p_keypair: None,
+        }
+    }
 }
 
 /// Parameters for telemetry configuration

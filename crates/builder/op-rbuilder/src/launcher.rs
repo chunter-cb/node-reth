@@ -4,6 +4,7 @@ use reth_optimism_rpc::OpEthApiBuilder;
 use crate::{
     args::*,
     builders::{BuilderConfig, BuilderMode, FlashblocksBuilder, PayloadBuilder, StandardBuilder},
+    debug_aa_rpc::{DebugBundlerApiServer, DebugBundlerRpc},
     metrics::{VERSION, record_flag_gauge_metrics},
     monitor_tx_pool::monitor_tx_pool,
     primitives::reth::engine_api_builder::OpEngineApiBuilder,
@@ -11,6 +12,12 @@ use crate::{
     tx::FBPooledTransaction,
     tx_data_store::{BaseApiExtServer, TxDataStoreExt},
 };
+use base_account_abstraction::mempool::{
+    p2p::UserOpGossipHandle, GossipConfig, MempoolConfig, SharedUserOpMempoolProvider,
+    UserOpGossip, UserOpPool,
+};
+use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 use core::fmt::Debug;
 use moka::future::Cache;
 use reth::builder::{NodeBuilder, WithLaunchContext};
@@ -99,8 +106,48 @@ where
         builder: WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, OpChainSpec>>,
         builder_args: OpRbuilderArgs,
     ) -> Result<()> {
-        let builder_config = BuilderConfig::<B::Config>::try_from(builder_args.clone())
+        let mut builder_config = BuilderConfig::<B::Config>::try_from(builder_args.clone())
             .expect("Failed to convert rollup args to builder config");
+
+        // Create AA mempool if enabled
+        // Keep a reference for the debug RPC
+        let aa_pool_for_rpc: Option<(Arc<RwLock<UserOpPool>>, u64, Option<UserOpGossipHandle>)> =
+            if builder_args.aa_mempool.enabled {
+                let chain_id = builder.config().chain.chain().id();
+                let mempool_config = MempoolConfig::default()
+                    .with_max_ops_per_sender(builder_args.aa_mempool.max_ops_per_sender)
+                    .with_max_pool_size(builder_args.aa_mempool.max_pool_size);
+
+                let aa_pool = UserOpPool::new_shared(mempool_config, chain_id);
+                let aa_pool_clone = aa_pool.clone();
+                let aa_provider = Arc::new(SharedUserOpMempoolProvider::new(aa_pool.clone()));
+
+                tracing::info!(
+                    target: "aa",
+                    max_ops_per_sender = builder_args.aa_mempool.max_ops_per_sender,
+                    max_pool_size = builder_args.aa_mempool.max_pool_size,
+                    chain_id = chain_id,
+                    "AA mempool enabled"
+                );
+
+                // Start p2p gossip if enabled
+                let gossip_handle = if builder_args.aa_mempool.p2p_enabled {
+                    start_aa_gossip_service(
+                        aa_pool,
+                        chain_id,
+                        builder_args.aa_mempool.p2p_port,
+                        &builder_args.aa_mempool.p2p_peers,
+                        builder_args.aa_mempool.p2p_keypair.as_deref(),
+                    )
+                } else {
+                    None
+                };
+
+                builder_config = builder_config.with_aa_mempool(aa_provider);
+                Some((aa_pool_clone, chain_id, gossip_handle))
+            } else {
+                None
+            };
 
         record_flag_gauge_metrics(&builder_args);
 
@@ -170,6 +217,20 @@ where
                 ctx.modules
                     .add_or_replace_configured(tx_data_store_ext.into_rpc())?;
 
+                // Register debug AA RPC if mempool is enabled
+                if let Some((aa_pool, chain_id, gossip_handle)) = aa_pool_for_rpc {
+                    tracing::info!(
+                        target: "aa",
+                        p2p_enabled = gossip_handle.is_some(),
+                        "Enabling debug_bundler RPC namespace (ERC-7769)"
+                    );
+                    let mut debug_rpc = DebugBundlerRpc::new(aa_pool, chain_id);
+                    if let Some(handle) = gossip_handle {
+                        debug_rpc = debug_rpc.with_gossip_handle(handle);
+                    }
+                    ctx.modules.add_or_replace_configured(debug_rpc.into_rpc())?;
+                }
+
                 Ok(())
             })
             .on_node_started(move |ctx| {
@@ -187,5 +248,70 @@ where
 
         handle.node_exit_future.await?;
         Ok(())
+    }
+}
+
+/// Start the AA p2p gossip service and return the handle for peer management
+fn start_aa_gossip_service(
+    pool: Arc<RwLock<UserOpPool>>,
+    chain_id: u64,
+    port: u16,
+    peers: &[String],
+    keypair_hex: Option<&str>,
+) -> Option<UserOpGossipHandle> {
+    use p2p::Multiaddr;
+
+    let known_peers: Vec<Multiaddr> = peers
+        .iter()
+        .filter_map(|s| {
+            s.parse::<Multiaddr>()
+                .map_err(|e| {
+                    tracing::warn!(
+                        target: "aa",
+                        peer = %s,
+                        error = %e,
+                        "Invalid AA p2p peer address"
+                    );
+                    e
+                })
+                .ok()
+        })
+        .collect();
+
+    let mut gossip_config = GossipConfig::default()
+        .with_port(port)
+        .with_known_peers(known_peers.clone());
+
+    // Add keypair if provided for deterministic peer ID
+    if let Some(keypair) = keypair_hex {
+        gossip_config = gossip_config.with_keypair_hex(keypair.to_string());
+    }
+
+    let cancel = CancellationToken::new();
+
+    match UserOpGossip::new(gossip_config, pool, chain_id, cancel) {
+        Ok((gossip, handle)) => {
+            // Log listening addresses
+            let addrs = gossip.multiaddrs();
+            tracing::info!(
+                target: "aa",
+                multiaddrs = ?addrs,
+                peers = ?known_peers,
+                "AA p2p gossip service starting"
+            );
+
+            // Spawn the gossip service
+            tokio::spawn(async move {
+                if let Err(e) = gossip.run().await {
+                    tracing::warn!(target: "aa", error = %e, "AA p2p gossip service error");
+                }
+            });
+
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::error!(target: "aa", error = %e, "Failed to start AA p2p gossip service");
+            None
+        }
     }
 }

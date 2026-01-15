@@ -18,6 +18,7 @@ unused_async = "warn"
 [dependencies]
 p2p = { path = "../p2p" }
 
+base-account-abstraction.workspace = true
 base-bundles.workspace = true
 reth.workspace = true
 reth-optimism-node.workspace = true

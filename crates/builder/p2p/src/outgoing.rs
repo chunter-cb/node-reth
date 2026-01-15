@@ -36,6 +36,19 @@ impl StreamsHandler {
         self.peers_to_stream.remove(peer);
     }
 
+    /// Get the number of connected peers
+    pub(crate) fn peer_count(&self) -> usize {
+        self.peers_to_stream.len()
+    }
+
+    /// Get all connected peers and their protocols
+    pub(crate) fn connected_peers(&self) -> Vec<(PeerId, Vec<StreamProtocol>)> {
+        self.peers_to_stream
+            .iter()
+            .map(|(peer_id, protocols)| (*peer_id, protocols.keys().cloned().collect()))
+            .collect()
+    }
+
     pub(crate) async fn broadcast_message<M: Message>(&mut self, message: M) -> eyre::Result<()> {
         use futures::{SinkExt as _, StreamExt as _};
         use tokio_util::{
@@ -49,14 +62,21 @@ impl StreamsHandler {
             .wrap_err("failed to serialize payload")?;
 
         let peers = self.peers_to_stream.keys().cloned().collect::<Vec<_>>();
+        debug!("p2p broadcast: {} total peers, protocol={protocol}", peers.len());
+        
         let mut futures = FuturesUnordered::new();
         for peer in peers {
             let protocol_to_stream = self
                 .peers_to_stream
                 .get_mut(&peer)
                 .expect("stream map must exist for peer");
+            
+            // Log available protocols for this peer
+            let available_protocols: Vec<_> = protocol_to_stream.keys().cloned().collect();
+            debug!("p2p broadcast: peer {peer} has protocols: {available_protocols:?}");
+            
             let Some(stream) = protocol_to_stream.remove(&protocol) else {
-                warn!("no stream for protocol {protocol:?} to peer {peer}");
+                warn!("p2p broadcast: no stream for protocol {protocol:?} to peer {peer}");
                 continue;
             };
             let stream = stream.compat();

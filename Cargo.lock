@@ -7614,6 +7614,7 @@ dependencies = [
  "alloy-transport-http",
  "anyhow",
  "async-trait",
+ "base-account-abstraction",
  "base-bundles",
  "chrono",
  "clap",

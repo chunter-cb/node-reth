@@ -14,11 +14,101 @@ use libp2p::{
 };
 use multiaddr::Protocol;
 use std::{collections::HashMap, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub use libp2p::{Multiaddr, StreamProtocol};
+
+/// Commands that can be sent to the p2p node for peer management
+#[derive(Debug)]
+pub enum NodeCommand {
+    /// Dial a peer at the given multiaddress
+    DialPeer {
+        addr: Multiaddr,
+        response: oneshot::Sender<Result<PeerId, String>>,
+    },
+    /// List all connected peers
+    ListPeers {
+        response: oneshot::Sender<Vec<PeerInfo>>,
+    },
+    /// Get node info (peer ID, listen addresses)
+    GetInfo {
+        response: oneshot::Sender<NodeInfo>,
+    },
+}
+
+/// Information about a connected peer
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub protocols: Vec<String>,
+}
+
+/// Information about this node
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeInfo {
+    pub peer_id: String,
+    pub listen_addrs: Vec<String>,
+    pub connected_peers: usize,
+}
+
+/// Handle for sending commands to a running p2p node
+#[derive(Clone)]
+pub struct NodeHandle {
+    command_tx: mpsc::Sender<NodeCommand>,
+    peer_id: PeerId,
+    listen_addrs: Vec<Multiaddr>,
+}
+
+impl NodeHandle {
+    /// Get this node's peer ID
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Get this node's listen addresses with peer ID appended
+    pub fn multiaddrs(&self) -> Vec<Multiaddr> {
+        self.listen_addrs
+            .iter()
+            .map(|addr| {
+                addr.clone()
+                    .with_p2p(self.peer_id)
+                    .expect("can add peer ID to multiaddr")
+            })
+            .collect()
+    }
+
+    /// Dial a peer at the given multiaddress
+    pub async fn dial_peer(&self, addr: Multiaddr) -> Result<PeerId, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::DialPeer { addr, response: tx })
+            .await
+            .map_err(|_| "node command channel closed".to_string())?;
+        rx.await.map_err(|_| "response channel closed".to_string())?
+    }
+
+    /// List all connected peers
+    pub async fn list_peers(&self) -> Result<Vec<PeerInfo>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::ListPeers { response: tx })
+            .await
+            .map_err(|_| "node command channel closed".to_string())?;
+        rx.await.map_err(|_| "response channel closed".to_string())
+    }
+
+    /// Get node info
+    pub async fn get_info(&self) -> Result<NodeInfo, String> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(NodeCommand::GetInfo { response: tx })
+            .await
+            .map_err(|_| "node command channel closed".to_string())?;
+        rx.await.map_err(|_| "response channel closed".to_string())
+    }
+}
 
 const DEFAULT_MAX_PEER_COUNT: u32 = 50;
 
@@ -66,6 +156,9 @@ pub struct Node<M> {
     /// Receiver for outgoing messages to be sent to peers.
     outgoing_message_rx: mpsc::Receiver<M>,
 
+    /// Receiver for node commands (peer management).
+    command_rx: mpsc::Receiver<NodeCommand>,
+
     /// Handler for managing outgoing streams to peers.
     /// Used to determine what peers to broadcast to when a
     /// new outgoing message is received on `outgoing_message_rx`.
@@ -102,16 +195,20 @@ impl<M: Message + 'static> Node<M> {
         use libp2p::futures::StreamExt as _;
 
         let Node {
-            peer_id: _,
+            peer_id,
             listen_addrs,
             mut swarm,
             known_peers,
             mut outgoing_message_rx,
+            mut command_rx,
             mut outgoing_streams_handler,
             cancellation_token,
             incoming_streams_handlers,
             protocols,
         } = self;
+
+        // Store listen addrs for later use in GetInfo
+        let listen_addrs_clone = listen_addrs.clone();
 
         for addr in listen_addrs {
             swarm
@@ -145,11 +242,56 @@ impl<M: Message + 'static> Node<M> {
                     handles.into_iter().for_each(|h| h.abort());
                     break Ok(());
                 }
+                Some(command) = command_rx.recv() => {
+                    match command {
+                        NodeCommand::DialPeer { addr, response } => {
+                            let mut addr_clone = addr.clone();
+                            let result = match addr_clone.pop() {
+                                Some(multiaddr::Protocol::P2p(target_peer_id)) => {
+                                    swarm.add_peer_address(target_peer_id, addr_clone.clone());
+                                    match swarm.dial(addr_clone) {
+                                        Ok(()) => {
+                                            info!(target: "p2p", peer = %target_peer_id, "Dialing peer");
+                                            Ok(target_peer_id)
+                                        }
+                                        Err(e) => Err(format!("dial failed: {e}")),
+                                    }
+                                }
+                                _ => Err("multiaddr must end with /p2p/<peer_id>".to_string()),
+                            };
+                            let _ = response.send(result);
+                        }
+                        NodeCommand::ListPeers { response } => {
+                            let peers: Vec<PeerInfo> = outgoing_streams_handler
+                                .connected_peers()
+                                .into_iter()
+                                .map(|(peer_id, protocols)| PeerInfo {
+                                    peer_id: peer_id.to_string(),
+                                    protocols: protocols.into_iter().map(|p| p.to_string()).collect(),
+                                })
+                                .collect();
+                            let _ = response.send(peers);
+                        }
+                        NodeCommand::GetInfo { response } => {
+                            let info = NodeInfo {
+                                peer_id: peer_id.to_string(),
+                                listen_addrs: listen_addrs_clone
+                                    .iter()
+                                    .map(|a| a.clone().with_p2p(peer_id).unwrap().to_string())
+                                    .collect(),
+                                connected_peers: outgoing_streams_handler.peer_count(),
+                            };
+                            let _ = response.send(info);
+                        }
+                    }
+                }
                 Some(message) = outgoing_message_rx.recv() => {
                     let protocol = message.protocol();
-                    debug!("received message to broadcast on protocol {protocol}");
+                    debug!("p2p: received message to broadcast on protocol {protocol}");
                     if let Err(e) = outgoing_streams_handler.broadcast_message(message).await {
-                        warn!("failed to broadcast message on protocol {protocol}: {e:?}");
+                        warn!("p2p: failed to broadcast message on protocol {protocol}: {e:?}");
+                    } else {
+                        debug!("p2p: successfully broadcast message on protocol {protocol}");
                     }
                 }
                 event = swarm.select_next_some() => {
@@ -170,8 +312,9 @@ impl<M: Message + 'static> Node<M> {
                         } => {
                             // when a new connection is established, open outbound streams for each protocol
                             // and add them to the outgoing streams handler.
-                            debug!("connection established with peer {peer_id}");
+                            info!(target: "p2p", peer = %peer_id, "Connection established with peer");
                             if !outgoing_streams_handler.has_peer(&peer_id) {
+                                debug!("p2p: opening streams for {} protocols", protocols.len());
                                 for protocol in &protocols {
                                         match swarm
                                         .behaviour_mut()
@@ -180,13 +323,15 @@ impl<M: Message + 'static> Node<M> {
                                         .await
                                     {
                                         Ok(stream) => { outgoing_streams_handler.insert_peer_and_stream(peer_id, protocol.clone(), stream);
-                                            debug!("opened outbound stream with peer {peer_id} with protocol {protocol} on connection {connection_id}");
+                                            info!(target: "p2p", peer = %peer_id, protocol = %protocol, "Opened outbound stream");
                                         }
                                         Err(e) => {
-                                            warn!("failed to open stream with peer {peer_id} on connection {connection_id}: {e:?}");
+                                            warn!("p2p: failed to open stream with peer {peer_id} on connection {connection_id}: {e:?}");
                                         }
                                     }
                                 }
+                            } else {
+                                debug!("p2p: peer {peer_id} already has streams");
                             }
                         }
                         SwarmEvent::ConnectionClosed {
@@ -194,7 +339,7 @@ impl<M: Message + 'static> Node<M> {
                             cause,
                             ..
                         } => {
-                            debug!("connection closed with peer {peer_id}: {cause:?}");
+                            info!(target: "p2p", peer = %peer_id, "Connection closed: {cause:?}");
                             outgoing_streams_handler.remove_peer(&peer_id);
                         }
                         SwarmEvent::Behaviour(event) => event.handle(&mut swarm),
@@ -210,6 +355,8 @@ pub struct NodeBuildResult<M> {
     pub node: Node<M>,
     pub outgoing_message_tx: mpsc::Sender<M>,
     pub incoming_message_rxs: HashMap<StreamProtocol, mpsc::Receiver<M>>,
+    /// Handle for peer management operations (dial, list peers, etc.)
+    pub node_handle: NodeHandle,
 }
 
 pub struct NodeBuilder {
@@ -313,9 +460,24 @@ impl NodeBuilder {
 
         let keypair = match keypair_hex {
             Some(hex) => {
-                let mut bytes = hex::decode(hex).wrap_err("failed to decode hex string")?;
-                let keypair = ed25519::Keypair::try_from_bytes(&mut bytes)
-                    .wrap_err("failed to create keypair from bytes")?;
+                let bytes = hex::decode(hex).wrap_err("failed to decode hex string")?;
+                // Support both 32-byte secret key and 64-byte full keypair
+                let keypair = if bytes.len() == 32 {
+                    // 32 bytes = secret key only, derive keypair
+                    let secret = ed25519::SecretKey::try_from_bytes(bytes)
+                        .wrap_err("failed to create secret key from bytes")?;
+                    ed25519::Keypair::from(secret)
+                } else if bytes.len() == 64 {
+                    // 64 bytes = full keypair (secret || public)
+                    let mut keypair_bytes = bytes;
+                    ed25519::Keypair::try_from_bytes(&mut keypair_bytes)
+                        .wrap_err("failed to create keypair from bytes")?
+                } else {
+                    eyre::bail!(
+                        "Invalid keypair length: expected 32 (secret) or 64 (keypair) bytes, got {}",
+                        bytes.len()
+                    );
+                };
                 Some(keypair.into())
             }
             None => None,
@@ -375,6 +537,14 @@ impl NodeBuilder {
         }
 
         let (outgoing_message_tx, outgoing_message_rx) = tokio::sync::mpsc::channel(100);
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(32);
+
+        // Create the node handle for peer management
+        let node_handle = NodeHandle {
+            command_tx,
+            peer_id,
+            listen_addrs: listen_addrs.clone(),
+        };
 
         Ok(NodeBuildResult {
             node: Node {
@@ -383,6 +553,7 @@ impl NodeBuilder {
                 listen_addrs,
                 known_peers,
                 outgoing_message_rx,
+                command_rx,
                 outgoing_streams_handler: outgoing::StreamsHandler::new(),
                 cancellation_token,
                 incoming_streams_handlers,
@@ -390,6 +561,7 @@ impl NodeBuilder {
             },
             outgoing_message_tx,
             incoming_message_rxs,
+            node_handle,
         })
     }
 }

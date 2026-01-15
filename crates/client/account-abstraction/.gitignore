@@ -1,0 +1,12 @@
+# Contract deployment artifacts (cloned by deploy_contracts.sh)
+contracts/solidity/*/lib/account-abstraction/
+contracts/solidity/*/lib/openzeppelin-contracts/
+
+# Hardhat artifacts
+contracts/solidity/*/node_modules/
+contracts/solidity/*/deployments/
+contracts/solidity/*/cache/
+contracts/solidity/*/artifacts/
+
+# Local config
+hardhat.config.local.ts

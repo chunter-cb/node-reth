@@ -1,4 +1,10 @@
-use super::{config::FlashblocksConfig, wspub::WebSocketPublisher};
+use super::{
+    bundler::Bundler,
+    config::FlashblocksConfig,
+    payload_handler::build_receipt,
+    wspub::WebSocketPublisher,
+};
+use alloy_evm::eth::receipt_builder::ReceiptBuilderCtx;
 use crate::{
     builders::{
         BuilderConfig,
@@ -12,6 +18,7 @@ use crate::{
     primitives::reth::ExecutionInfo,
     traits::{ClientBounds, PoolBounds},
 };
+use base_account_abstraction::mempool::UserOpMempoolProvider;
 use alloy_consensus::{
     BlockBody, EMPTY_OMMER_ROOT_HASH, Header, constants::EMPTY_WITHDRAWALS, proofs,
 };
@@ -23,6 +30,7 @@ use reth::payload::PayloadBuilderAttributes;
 use reth_basic_payload_builder::BuildOutcome;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::EthChainSpec;
+use alloy_evm::Evm as _;
 use reth_evm::{ConfigureEvm, execute::BlockBuilder};
 use reth_node_api::{Block, NodePrimitives, PayloadBuilderError};
 use reth_optimism_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
@@ -41,7 +49,7 @@ use reth_revm::{
 };
 use reth_transaction_pool::TransactionPool;
 use reth_trie::{HashedPostState, updates::TrieUpdates};
-use revm::Database;
+use revm::{Database, DatabaseCommit};
 use rollup_boost::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1,
 };
@@ -136,7 +144,7 @@ impl OpPayloadBuilderCtx<FlashblocksExtraCtx> {
 }
 
 /// Optimism's payload builder
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     /// The type responsible for creating the evm.
     pub evm_config: OpEvmConfig,
@@ -158,6 +166,17 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     pub builder_tx: BuilderTx,
     /// Rate limiting based on gas. This is an optional feature.
     pub address_gas_limiter: AddressGasLimiter,
+    /// Optional AA mempool provider for bundling UserOperations
+    pub aa_mempool: Option<Arc<dyn UserOpMempoolProvider>>,
+}
+
+impl<Pool, Client, BuilderTx> std::fmt::Debug for OpPayloadBuilder<Pool, Client, BuilderTx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpPayloadBuilder")
+            .field("config", &self.config)
+            .field("aa_mempool_enabled", &self.aa_mempool.is_some())
+            .finish()
+    }
 }
 
 impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
@@ -184,7 +203,17 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
             metrics,
             builder_tx,
             address_gas_limiter,
+            aa_mempool: None,
         }
+    }
+
+    /// Add an AA mempool provider for bundling UserOperations
+    pub(super) fn with_aa_mempool(
+        mut self,
+        aa_mempool: Arc<dyn UserOpMempoolProvider>,
+    ) -> Self {
+        self.aa_mempool = Some(aa_mempool);
+        self
     }
 }
 
@@ -719,6 +748,13 @@ where
             .payload_transaction_simulation_gauge
             .set(payload_transaction_simulation_time);
 
+        // AA Bundler Integration
+        // Bundle UserOperations after standard transactions when:
+        // 1. Gas threshold is reached, OR
+        // 2. No more pending standard transactions in pool
+        let pool_has_pending = !self.pool.pending_transactions().is_empty();
+        self.try_bundle_userops(state, ctx, info, target_gas_for_batch, pool_has_pending)?;
+
         if let Err(e) = self
             .builder_tx
             .add_builder_txs(&state_provider, info, ctx, state, false)
@@ -822,6 +858,221 @@ where
                 Ok(Some(next_extra_ctx))
             }
         }
+    }
+
+    /// Try to bundle UserOperations after standard transactions
+    ///
+    /// Bundling is triggered when:
+    /// - Gas threshold is reached (cumulative gas >= threshold % of target), OR
+    /// - No more pending standard transactions in pool
+    ///
+    /// The bundler will fetch available UserOps from the mempool and create handleOps transactions.
+    ///
+    /// Returns Ok(()) on success, or an error if bundling fails critically.
+    fn try_bundle_userops<
+        DB: Database<Error = ProviderError> + std::fmt::Debug,
+    >(
+        &self,
+        state: &mut State<DB>,
+        ctx: &OpPayloadBuilderCtx<FlashblocksExtraCtx>,
+        info: &mut ExecutionInfo<FlashblocksExecutionInfo>,
+        target_gas_for_batch: u64,
+        pool_has_pending: bool,
+    ) -> Result<(), PayloadBuilderError> {
+        // Check if bundler is enabled and we have a mempool
+        let aa_mempool = match &self.aa_mempool {
+            Some(pool) if self.config.specific.bundler.enabled => {
+                info!(target: "bundler", "AA mempool available, bundler enabled");
+                pool
+            },
+            Some(_) => {
+                info!(target: "bundler", "AA mempool available but bundler disabled");
+                return Ok(());
+            }
+            None => {
+                // No mempool configured - this is expected if AA is not enabled
+                return Ok(());
+            }
+        };
+
+        // Get the builder signer (required for signing bundle txs)
+        let signer = match &self.config.builder_signer {
+            Some(s) => s,
+            None => {
+                warn!(target: "bundler", "Bundler enabled but no builder signer configured");
+                return Ok(());
+            }
+        };
+
+        // Check if we should bundle:
+        // 1. Gas threshold reached, OR
+        // 2. No more pending standard transactions
+        let gas_used_percent = if target_gas_for_batch > 0 {
+            (info.cumulative_gas_used * 100) / target_gas_for_batch
+        } else {
+            100
+        };
+        let threshold = self.config.specific.bundler.gas_threshold_percent as u64;
+        let no_pending_txs = !pool_has_pending;
+
+        if gas_used_percent < threshold && !no_pending_txs {
+            // Only skip if BOTH conditions are true (below threshold AND have pending txs)
+            return Ok(());
+        }
+
+        info!(
+            target: "bundler",
+            gas_used_percent,
+            threshold,
+            no_pending_txs,
+            "Triggering AA bundler"
+        );
+
+        // Get nonce for bundle transactions from state using a temporary EVM
+        let mut evm = ctx.evm_config.evm_with_env(&mut *state, ctx.evm_env.clone());
+        let nonce = evm.db_mut().basic(signer.address)
+            .map(|acc| acc.unwrap_or_default().nonce)
+            .unwrap_or(0);
+        drop(evm); // Release the borrow on state
+        
+        let remaining_gas = target_gas_for_batch.saturating_sub(info.cumulative_gas_used);
+        
+        // Create bundler
+        let bundler = Bundler::new(
+            &self.config.specific.bundler,
+            aa_mempool.as_ref(),
+            signer,
+            ctx.chain_id(),
+            ctx.base_fee().into(),
+        );
+
+        // Build and execute bundles
+        let mut retries = 0;
+        let max_retries = self.config.specific.bundler.max_bundle_retries;
+        
+        while retries < max_retries {
+            let bundles = bundler.build_bundles(nonce + retries as u64, remaining_gas);
+            
+            if bundles.is_empty() {
+                info!(target: "bundler", "No bundles to build (mempool empty or all ops excluded)");
+                break;
+            }
+
+            let mut all_succeeded = true;
+            for bundle_result in bundles {
+                match bundle_result {
+                    Ok(bundle) => {
+                        // Execute the bundle transaction
+                        let mut evm = ctx.evm_config.evm_with_env(&mut *state, ctx.evm_env.clone());
+                        
+                        // Log bundle tx details for debugging
+                        info!(
+                            target: "bundler",
+                            entry_point = %bundle.entry_point,
+                            bundle_gas_limit = bundle.gas_limit,
+                            ops_count = bundle.ops_count,
+                            "Executing bundle transaction"
+                        );
+                        
+                        match evm.transact(&bundle.tx) {
+                            Ok(result_and_state) => {
+                                if result_and_state.result.is_success() {
+                                    // Update cumulative gas BEFORE building receipt
+                                    info.cumulative_gas_used += result_and_state.result.gas_used();
+                                    info.cumulative_da_bytes_used += bundle.da_size;
+                                    
+                                    // Build receipt for the bundle transaction
+                                    let is_canyon = ctx.chain_spec
+                                        .is_canyon_active_at_timestamp(ctx.attributes().timestamp());
+                                    let receipt_ctx = ReceiptBuilderCtx {
+                                        tx: bundle.tx.inner(),
+                                        evm: &evm,
+                                        result: result_and_state.result,
+                                        state: &result_and_state.state,
+                                        cumulative_gas_used: info.cumulative_gas_used,
+                                    };
+                                    info.receipts.push(build_receipt(
+                                        &ctx.evm_config,
+                                        receipt_ctx,
+                                        None, // bundle txs are not deposits
+                                        is_canyon,
+                                    ));
+                                    
+                                    // Commit the state changes
+                                    evm.db_mut().commit(result_and_state.state);
+                                    
+                                    // Add transaction and sender
+                                    info.executed_transactions.push(bundle.tx.into_inner());
+                                    info.executed_senders.push(signer.address);
+
+                                    // Confirm bundle was included (updates reputation)
+                                    bundler.confirm_bundle(bundle.entry_point, &bundle.op_hashes);
+                                    
+                                    info!(
+                                        target: "bundler",
+                                        entry_point = %bundle.entry_point,
+                                        ops_count = bundle.ops_count,
+                                        gas_used = bundle.gas_limit,
+                                        "Bundle included successfully"
+                                    );
+                                } else {
+                                    // Bundle reverted - parse failure and remove offending op
+                                    let output = result_and_state.result.output().unwrap_or_default();
+                                    
+                                    // Log the revert reason for debugging
+                                    let revert_hex = alloy_primitives::hex::encode(&output);
+                                    warn!(
+                                        target: "bundler",
+                                        entry_point = %bundle.entry_point,
+                                        revert_data = %revert_hex,
+                                        revert_len = output.len(),
+                                        "Bundle execution reverted"
+                                    );
+                                    
+                                    bundler.handle_bundle_failure(
+                                        bundle.entry_point,
+                                        &bundle.op_hashes,
+                                        &output,
+                                    );
+                                    all_succeeded = false;
+                                    warn!(
+                                        target: "bundler",
+                                        entry_point = %bundle.entry_point,
+                                        "Bundle reverted, removed offending UserOp"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                // EVM error - release the bundle ops
+                                bundler.release_bundle(bundle.entry_point, &bundle.op_hashes);
+                                all_succeeded = false;
+                                error!(
+                                    target: "bundler",
+                                    entry_point = %bundle.entry_point,
+                                    error = %err,
+                                    "Failed to execute bundle"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // Bundle building error (unsupported version, signing, etc.)
+                        debug!(target: "bundler", error = %err, "Bundle build error");
+                    }
+                }
+            }
+
+            if all_succeeded {
+                break;
+            }
+            retries += 1;
+        }
+
+        if retries >= max_retries {
+            warn!(target: "bundler", "Reached max bundle retries ({})", max_retries);
+        }
+
+        Ok(())
     }
 
     /// Do some logging and metric recording when we stop build flashblocks

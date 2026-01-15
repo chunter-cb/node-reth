@@ -3,6 +3,9 @@ use core::{
     fmt::Debug,
     time::Duration,
 };
+use std::sync::Arc;
+
+use base_account_abstraction::mempool::UserOpMempoolProvider;
 use reth_node_builder::components::PayloadServiceBuilder;
 use reth_optimism_evm::OpEvmConfig;
 use reth_optimism_payload_builder::config::{OpDAConfig, OpGasLimitConfig};
@@ -130,6 +133,10 @@ pub struct BuilderConfig<Specific: Clone> {
 
     /// Unified transaction data store (backrun bundles + resource metering)
     pub tx_data_store: TxDataStore,
+
+    /// Optional Account Abstraction (ERC-4337) UserOperation mempool provider.
+    /// When set, the builder will bundle UserOperations into blocks.
+    pub aa_mempool: Option<Arc<dyn UserOpMempoolProvider>>,
 }
 
 impl<S: Debug + Clone> core::fmt::Debug for BuilderConfig<S> {
@@ -153,7 +160,16 @@ impl<S: Debug + Clone> core::fmt::Debug for BuilderConfig<S> {
             .field("max_gas_per_txn", &self.max_gas_per_txn)
             .field("gas_limiter_config", &self.gas_limiter_config)
             .field("tx_data_store", &self.tx_data_store)
+            .field("aa_mempool_enabled", &self.aa_mempool.is_some())
             .finish()
+    }
+}
+
+impl<S: Clone> BuilderConfig<S> {
+    /// Set the AA mempool provider for UserOperation bundling
+    pub fn with_aa_mempool(mut self, mempool: Arc<dyn UserOpMempoolProvider>) -> Self {
+        self.aa_mempool = Some(mempool);
+        self
     }
 }
 
@@ -172,6 +188,7 @@ impl<S: Default + Clone> Default for BuilderConfig<S> {
             max_gas_per_txn: None,
             gas_limiter_config: GasLimiterArgs::default(),
             tx_data_store: TxDataStore::default(),
+            aa_mempool: None,
         }
     }
 }
@@ -199,6 +216,8 @@ where
                 args.tx_data_store_buffer_size,
             ),
             specific: S::try_from(args)?,
+            // AA mempool is set separately after config creation if enabled
+            aa_mempool: None,
         })
     }
 }

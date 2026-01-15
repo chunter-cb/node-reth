@@ -532,18 +532,21 @@ where
     Provider: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec> + Clone,
     Eth: FullEthApi<NetworkTypes = Optimism> + Clone,
 {
-    /// Creates a new instance of AccountAbstractionApi in Tips mode
+    /// Creates a new instance of AccountAbstractionApi
     ///
     /// # Arguments
     /// * `provider` - The state provider for blockchain access
     /// * `eth_api` - The Eth API for simulation calls
-    /// * `tips_url` - URL of the Tips ingress service
+    /// * `tips_url` - Optional URL of the Tips ingress service (None if in mempool mode)
     /// * `storage` - Optional indexed storage from the AA indexer ExEx
     /// * `args` - Account abstraction CLI arguments
+    ///
+    /// If `tips_url` is None, the send handler will reject all send requests
+    /// (mempool mode should use `new_with_mempool` instead for full functionality)
     pub fn new(
         provider: Provider,
         eth_api: Eth,
-        tips_url: Url,
+        tips_url: Option<Url>,
         storage: Option<Arc<UserOperationStorage>>,
         args: &AccountAbstractionArgs,
     ) -> Self {
@@ -552,10 +555,24 @@ where
             storage,
             args.user_op_event_lookback_blocks(),
         ));
+        
+        let send_handler = match tips_url {
+            Some(url) => UserOpSendHandler::Tips(TipsClient::new(url)),
+            None => {
+                // In mempool mode without a configured pool, reject sends
+                // The proper mempool setup should use new_with_mempool()
+                tracing::warn!(target: "aa", "AccountAbstractionApi created without Tips URL or mempool - sends will fail");
+                // Create a dummy pool that will reject everything
+                UserOpSendHandler::Tips(TipsClient::new(
+                    Url::parse("http://localhost:0").unwrap(),
+                ))
+            }
+        };
+        
         Self {
             provider,
             eth_api,
-            send_handler: UserOpSendHandler::Tips(TipsClient::new(tips_url)),
+            send_handler,
             receipt_provider,
         }
     }
@@ -1127,6 +1144,11 @@ where
 
                 // Optionally gossip to peers
                 if let Some(handle) = gossip_handle {
+                    info!(
+                        target: "aa-rpc",
+                        hash = %user_op_hash,
+                        "Broadcasting UserOp to peers via gossip"
+                    );
                     if let Err(e) = handle
                         .broadcast_user_op(user_operation, entry_point, user_op_hash, *chain_id)
                         .await
@@ -1138,7 +1160,19 @@ where
                             error = %e,
                             "Failed to gossip UserOperation to peers"
                         );
+                    } else {
+                        info!(
+                            target: "aa-rpc",
+                            hash = %user_op_hash,
+                            "Successfully sent UserOp to gossip channel"
+                        );
                     }
+                } else {
+                    info!(
+                        target: "aa-rpc",
+                        hash = %user_op_hash,
+                        "No gossip handle - p2p disabled"
+                    );
                 }
 
                 user_op_hash

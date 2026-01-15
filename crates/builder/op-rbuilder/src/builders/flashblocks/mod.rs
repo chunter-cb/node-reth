@@ -4,8 +4,9 @@ use config::FlashblocksConfig;
 use service::FlashblocksServiceBuilder;
 
 mod best_txs;
+pub(crate) mod bundler;
 mod builder_tx;
-mod config;
+pub(crate) mod config;
 mod ctx;
 mod p2p;
 mod payload;

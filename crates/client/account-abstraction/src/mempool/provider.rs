@@ -135,11 +135,34 @@ impl UserOpMempoolProvider for SharedUserOpMempoolProvider {
         max_gas: u64,
     ) -> Vec<PooledUserOp> {
         let pool = self.pool.read();
+        let total = pool.total_count();
+        let count_for_ep = pool.count(&entry_point);
+        let entrypoints = pool.entrypoints();
+        
+        tracing::info!(
+            target: "aa-provider",
+            total_count = total,
+            entry_point = %entry_point,
+            count_for_entry_point = count_for_ep,
+            entrypoints = ?entrypoints,
+            max_count,
+            max_gas,
+            "get_best_userops called"
+        );
+        
         // Clone the results since we can't return references from a lock guard
-        pool.get_best_userops(&entry_point, max_count, max_gas)
+        let result = pool.get_best_userops(&entry_point, max_count, max_gas)
             .into_iter()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+            
+        tracing::info!(
+            target: "aa-provider",
+            result_count = result.len(),
+            "get_best_userops returning"
+        );
+        
+        result
     }
 
     fn mark_pending_inclusion(&self, entry_point: Address, hashes: &[B256]) {

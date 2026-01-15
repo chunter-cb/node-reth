@@ -78,6 +78,7 @@ impl FlashblocksServiceBuilder {
                 node,
                 outgoing_message_tx,
                 mut incoming_message_rxs,
+                node_handle: _, // Not used for flashblocks p2p
             } = builder
                 .with_agent_version(AGENT_VERSION.to_string())
                 .with_protocol(FLASHBLOCKS_STREAM_PROTOCOL)
@@ -112,7 +113,9 @@ impl FlashblocksServiceBuilder {
             WebSocketPublisher::new(self.0.specific.ws_addr, metrics.clone())
                 .wrap_err("failed to create ws publisher")?
                 .into();
-        let payload_builder = OpPayloadBuilder::new(
+        
+        // Create payload builder, optionally with AA mempool
+        let mut payload_builder = OpPayloadBuilder::new(
             OpEvmConfig::optimism(ctx.chain_spec()),
             pool,
             ctx.provider().clone(),
@@ -122,6 +125,12 @@ impl FlashblocksServiceBuilder {
             ws_pub.clone(),
             metrics.clone(),
         );
+
+        // Wire up AA mempool if configured
+        if let Some(aa_mempool) = self.0.aa_mempool.clone() {
+            tracing::info!(target: "payload_builder", "AA mempool configured for payload builder");
+            payload_builder = payload_builder.with_aa_mempool(aa_mempool);
+        }
         let payload_job_config = BasicPayloadJobGeneratorConfig::default();
 
         let payload_generator = BlockPayloadJobGenerator::with_builder(

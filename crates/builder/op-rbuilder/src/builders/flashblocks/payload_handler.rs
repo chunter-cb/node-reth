@@ -399,7 +399,7 @@ fn execute_transactions(
     Ok(())
 }
 
-fn build_receipt<E: alloy_evm::Evm>(
+pub(crate) fn build_receipt<E: alloy_evm::Evm>(
     evm_config: &OpEvmConfig,
     ctx: ReceiptBuilderCtx<'_, OpTransactionSigned, E>,
     deposit_nonce: Option<u64>,

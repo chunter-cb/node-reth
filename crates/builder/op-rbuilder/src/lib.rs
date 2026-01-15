@@ -1,5 +1,6 @@
 pub mod args;
 pub mod builders;
+pub mod debug_aa_rpc;
 pub mod flashtestations;
 pub mod gas_limiter;
 pub mod launcher;

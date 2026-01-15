@@ -5,9 +5,13 @@ use std::sync::Arc;
 
 use base_account_abstraction_indexer::UserOperationStorage;
 use base_client_node::{BaseNodeExtension, FromExtensionConfig, OpBuilder};
-use tracing::info;
+use parking_lot::RwLock;
+use reth_provider::ChainSpecProvider;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::{
+    mempool::{GossipConfig, UserOpGossip, UserOpGossipHandle, UserOpPool},
     AccountAbstractionApiImpl, AccountAbstractionApiServer, AccountAbstractionArgs,
     BaseAccountAbstractionApiImpl, BaseAccountAbstractionApiServer,
 };
@@ -71,21 +75,76 @@ impl BaseNodeExtension for AccountAbstractionExtension {
             Ok(base_account_abstraction_indexer::account_abstraction_indexer_exex(ctx, storage))
         });
 
-        // Install RPC extensions
-        let tips_url = args.send_url();
+        // Only get TIPS URL if not in mempool mode
+        let tips_url = if args.mempool_enabled {
+            None
+        } else {
+            Some(args.send_url())
+        };
+        let mempool_enabled = args.mempool_enabled;
+        let p2p_enabled = args.p2p_enabled;
+        let mempool_config = args.mempool_config();
+        let gossip_config = args.gossip_config();
         let args_clone = args.clone();
 
         builder.extend_rpc_modules(move |ctx| {
             info!(target: "aa", "Starting Account Abstraction RPC");
 
+            // Get chain ID for UserOp hash computation
+            let chain_id = ctx.provider().chain_spec().chain().id();
+
             // Create the main eth_ and base_ RPC implementations
-            let aa_api = AccountAbstractionApiImpl::new(
-                ctx.provider().clone(),
-                ctx.registry.eth_api().clone(),
-                tips_url.clone(),
-                storage.clone(),
-                &args_clone,
-            );
+            let aa_api = if mempool_enabled {
+                // Create mempool
+                let pool = UserOpPool::new(mempool_config.clone(), chain_id);
+                let mempool = Arc::new(RwLock::new(pool));
+
+                // Start p2p gossip if enabled
+                let gossip_handle: Option<UserOpGossipHandle> = if p2p_enabled {
+                    if let Some(config) = gossip_config.clone() {
+                        match start_gossip_service(config, mempool.clone(), chain_id) {
+                            Ok(handle) => {
+                                info!(target: "aa", "P2P gossip service started");
+                                Some(handle)
+                            }
+                            Err(e) => {
+                                warn!(target: "aa", error = %e, "Failed to start p2p gossip");
+                                None
+                            }
+                        }
+                    } else {
+                        warn!(target: "aa", "P2P enabled but no gossip config provided");
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                info!(
+                    target: "aa",
+                    chain_id = chain_id,
+                    p2p_enabled = gossip_handle.is_some(),
+                    "Using local mempool mode"
+                );
+                AccountAbstractionApiImpl::new_with_mempool(
+                    ctx.provider().clone(),
+                    ctx.registry.eth_api().clone(),
+                    mempool,
+                    chain_id,
+                    gossip_handle,
+                    storage.clone(),
+                    &args_clone,
+                )
+            } else {
+                info!(target: "aa", "Using TIPS relay mode");
+                AccountAbstractionApiImpl::new(
+                    ctx.provider().clone(),
+                    ctx.registry.eth_api().clone(),
+                    tips_url.clone(),
+                    storage.clone(),
+                    &args_clone,
+                )
+            };
 
             let base_aa_api = BaseAccountAbstractionApiImpl::new(
                 ctx.provider().clone(),
@@ -99,6 +158,7 @@ impl BaseNodeExtension for AccountAbstractionExtension {
             info!(
                 target: "aa",
                 indexer_enabled = args_clone.indexer_enabled,
+                mempool_enabled = args_clone.mempool_enabled,
                 debug = args_clone.debug,
                 "Account Abstraction RPC enabled"
             );
@@ -114,4 +174,33 @@ impl FromExtensionConfig for AccountAbstractionExtension {
     fn from_config(config: Self::Config) -> Self {
         Self::new(config)
     }
+}
+
+/// Start the p2p gossip service in a background task
+fn start_gossip_service(
+    config: GossipConfig,
+    pool: Arc<RwLock<UserOpPool>>,
+    chain_id: u64,
+) -> Result<UserOpGossipHandle, String> {
+    let cancel = CancellationToken::new();
+
+    let (gossip, handle) =
+        UserOpGossip::new(config, pool, chain_id, cancel).map_err(|e| e.to_string())?;
+
+    // Log the multiaddresses for peer discovery
+    let addrs = gossip.multiaddrs();
+    info!(
+        target: "aa",
+        multiaddrs = ?addrs,
+        "AA p2p gossip node listening"
+    );
+
+    // Spawn the gossip service in a background task
+    tokio::spawn(async move {
+        if let Err(e) = gossip.run().await {
+            warn!(target: "aa", error = %e, "P2P gossip service error");
+        }
+    });
+
+    Ok(handle)
 }

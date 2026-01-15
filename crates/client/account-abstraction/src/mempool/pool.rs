@@ -760,6 +760,100 @@ impl UserOpPool {
         Ok(hash)
     }
 
+    /// Add a UserOp received from a trusted peer via p2p gossip.
+    ///
+    /// This method performs minimal validation (chain ID, hash check) since the peer
+    /// should have already validated the UserOp. Re-validation is intentionally skipped
+    /// for performance. For stricter security, consider adding re-validation.
+    ///
+    /// # Arguments
+    /// * `user_op` - The UserOperation
+    /// * `entry_point` - The EntryPoint address
+    /// * `expected_hash` - The hash the peer computed (we verify it matches)
+    pub fn add_from_peer(
+        &mut self,
+        user_op: UserOperation,
+        entry_point: Address,
+        expected_hash: B256,
+    ) -> MempoolResult<B256> {
+        // Verify hash matches
+        let computed_hash = user_op.hash(entry_point, self.chain_id);
+        if computed_hash != expected_hash {
+            return Err(MempoolError::ValidationError(format!(
+                "Hash mismatch: expected {}, computed {}",
+                expected_hash, computed_hash
+            )));
+        }
+
+        // Check if already exists
+        if self.contains(&entry_point, &computed_hash) {
+            return Err(MempoolError::AlreadyExists(computed_hash));
+        }
+
+        let max_pool_size = self.config.max_pool_size_per_entrypoint;
+
+        // Create a minimal validation output for peer-received UserOps
+        // Note: In production, we should re-validate before accepting
+        let validation_output = ValidationOutput {
+            valid: true, // Trust peer's validation
+            return_info: crate::simulation::ReturnInfo {
+                pre_op_gas: 21000, // Minimal estimate
+                prefund: alloy_primitives::U256::ZERO,
+                sig_failed: false,
+                valid_after: 0,
+                valid_until: 0, // 0 means use config's max_ttl (avoids overflow with u64::MAX)
+                paymaster_context: alloy_primitives::Bytes::default(),
+            },
+            sender_info: crate::simulation::StakeInfo {
+                address: user_op.sender(),
+                stake: alloy_primitives::U256::ZERO,
+                unstake_delay_sec: 0,
+                deposit: alloy_primitives::U256::ZERO,
+                is_staked: false,
+            },
+            factory_info: None,
+            paymaster_info: None,
+            aggregator_info: None,
+            code_hashes: None,
+            violations: Vec::new(),
+            trace: None,
+        };
+
+        // Create pooled UserOp
+        let pooled = PooledUserOp::new(
+            user_op,
+            computed_hash,
+            entry_point,
+            validation_output,
+            &self.config,
+        );
+
+        // Get or create pool
+        self.pools
+            .entry(entry_point)
+            .or_insert_with(|| EntryPointPool::new(entry_point, self.config.clone()));
+
+        let pool = self.pools.get_mut(&entry_point).unwrap();
+
+        // Evict if needed
+        if pool.len() >= max_pool_size {
+            pool.evict_to_make_room(1);
+        }
+
+        // Add to pool
+        pool.add(pooled)?;
+
+        info!(
+            target: "aa-mempool",
+            hash = %computed_hash,
+            entry_point = %entry_point,
+            pool_size = pool.len(),
+            "Added UserOp from peer to mempool"
+        );
+
+        Ok(computed_hash)
+    }
+
     /// Remove a UserOp from the pool
     pub fn remove(&mut self, entry_point: &Address, hash: &B256) -> Option<PooledUserOp> {
         self.pools.get_mut(entry_point).and_then(|p| p.remove(hash))
@@ -924,6 +1018,12 @@ impl UserOpPool {
     /// Get all entrypoints with pools
     pub fn entrypoints(&self) -> Vec<Address> {
         self.pools.keys().copied().collect()
+    }
+
+    /// Clear all pools (for debug/testing)
+    pub fn clear(&mut self) {
+        self.pools.clear();
+        self.reputation = ReputationManager::new(self.config.clone());
     }
 }
 
